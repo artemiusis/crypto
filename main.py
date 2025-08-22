@@ -1,309 +1,34 @@
-﻿
+﻿# -*- coding: utf-8 -*-
+import re
 from aiogram import Bot, Dispatcher, types
-from aiogram.contrib.middlewares.logging import LoggingMiddleware
+from aiogram.types import ParseMode
 from aiogram.utils import executor
-from aiogram.dispatcher.filters.state import State, StatesGroup
-from aiogram.dispatcher import FSMContext
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
-from aiogram.types import ReplyKeyboardRemove, \
-    ReplyKeyboardMarkup, KeyboardButton, \
-    InlineKeyboardMarkup, InlineKeyboardButton
-import asyncio
-import websockets
-import json
-from datetime import datetime, timedelta
-from collections import defaultdict
-import requests
-import os
-import markups
+from aiogram.dispatcher import FSMContext
+from aiogram.dispatcher.filters.state import State, StatesGroup
 import config
-from db import Database
-db = Database("database.db")
-operations = defaultdict(list)
-last_operation_time = {}
-used_mints = []
 bot = Bot(token=config.API_TOKEN)
 storage = MemoryStorage()
-dp = Dispatcher(bot, storage=storage)  # Підключаємо сховище до Dispatcher
-dp.middleware.setup(LoggingMiddleware())
-last_operation_time = defaultdict(lambda: datetime.utcnow())
-MINTS_FILE = config.MINTS_FILE
+dp = Dispatcher(bot, storage=storage)
+import os
+import json
+import requests
+import asyncio
+from datetime import datetime, timedelta
+from collections import Counter
+import matplotlib.pyplot as plt
+import io
+DATA_FILE = config.DATA_FILE
 running_tasks = {}
-background_tasks = {}
-class CreateSignal(StatesGroup):
-    WaitingForSignalName = State()
-    WaitingForPriceGrowth = State()
-    WaitingForAge = State()
-    WaitingForLiquidity = State()
-    WaitingForVolume = State()
-    WaitingForMarketCap = State()
-    WaitingForBoosts = State()
-    WaitingForVolumeGrowth = State()
 
-# Обробка стартової команди
-@dp.message_handler(commands=['start'])
-async def start(message: types.Message):
-    if message.chat.type=='private':
-        
-        if not db.user_exists(message.from_user.id):
-            db.add_user(message.from_user.id)
-        main_menu = markups.GenMenu
-        await message.answer("Вітаю! Ось головне меню:", reply_markup=main_menu)
-
-# Обробка кнопки "Мої сигнали"
-@dp.message_handler(lambda message: message.text == "🙎‍♂ Мої сигнали")
-async def my_signals(message: types.Message):
-    user_signals_menu = markups.create_signal_menu(message.from_user.id)
-    await message.answer("Список ваших сигналів:", reply_markup=user_signals_menu)
-
-@dp.callback_query_handler(lambda c: c.data.startswith('signal_'))
-async def signal_info(callback_query: types.CallbackQuery):
-    signal_name = callback_query.data[len('signal_'):]  # Отримуємо назву сигналу
-    info = db.select_signal_info(user_id = callback_query.from_user.id, signal_name = signal_name)
-    name, growth, age, market_cap, volume, liquidity, boosts, volume_growth, time = info
-    status = db.check_signal_status(callback_query.from_user.id, name)
-    signal_info = f"Інформація про сигнал: {signal_name}\nАктивний: {status}\n\nНазва: {name}\nВідсоток: {growth}\nКапіталізація: {market_cap}\nОб'єм: {volume}\nЛіквідність: {liquidity}\nМінімальна кількість бустів: {boosts}\nБажаний volume_growth: {volume_growth}% за час {time} хвилин"  # Тут виводимо всю інформацію про сигнал
-
-    # Кнопки для видалення або повернення
-    keyboard = InlineKeyboardMarkup()
-    delete_button = InlineKeyboardButton("Видалити сигнал", callback_data=f"delete_{signal_name}")
-    back_button = InlineKeyboardButton("Назад", callback_data="back_to_signals")
-    if not status:
-        activate_button = InlineKeyboardButton("Активувати сигнал", callback_data=f"activate_signal_{signal_name}")
-        keyboard.add(delete_button, back_button, activate_button)
-    else:
-        deactivate_button = InlineKeyboardButton("Деактивувати сигнал", callback_data=f"deactivate_signal_{signal_name}")
-        keyboard.add(delete_button, back_button, deactivate_button)
-    
-    
-
-    # Відповідь користувачу з інформацією про сигнал та кнопками
-    await bot.send_message(callback_query.from_user.id, signal_info, reply_markup=keyboard)
-    await callback_query.answer()  # Відповідаємо на callback, щоб зняти індикатор наведеності
-
-@dp.callback_query_handler(lambda c: c.data.startswith('delete_'))
-async def delete_signal(callback_query: types.CallbackQuery):
-    signal_name = callback_query.data[len('delete_'):]  # Отримуємо назву сигналу для видалення
-    db.delete_signal(user_id = callback_query.from_user.id, signal_name = signal_name)
-    # Тут треба реалізувати видалення сигналу з бази даних
-    # Наприклад: db.delete_signal(signal_name)
-
-    # Повідомлення, що сигнал видалено
-    await bot.send_message(callback_query.from_user.id, f"Сигнал '{signal_name}' успішно видалено!")
-    
-    user_signals_menu = markups.create_signal_menu(callback_query.from_user.id)
-    await bot.send_message(callback_query.from_user.id, "Список ваших сигналів:", reply_markup=user_signals_menu)
-    await callback_query.answer() 
-
-@dp.callback_query_handler(lambda c: c.data == 'back_to_signals')
-async def back_to_signals(callback_query: types.CallbackQuery):
-
-    user_signals_menu = markups.create_signal_menu(callback_query.from_user.id)
-    
-    # Відправляємо повідомлення з кнопками
-    await bot.send_message(callback_query.from_user.id, "Ось ваші сигнали:", reply_markup=user_signals_menu)
-    await callback_query.answer()  # Відповідаємо на callback
-
-# Обробка кнопки "Створити сигнал"
-@dp.message_handler(lambda message: message.text == "💻 Створити сигнал")
-async def create_signal(message: types.Message):
-    await CreateSignal.WaitingForSignalName.set()  # Переходимо в стан очікування назви сигналу
-    await message.answer("Введіть назву сигналу:")
-
-@dp.callback_query_handler(lambda c: c.data == 'back')
-async def back_to_menu(callback_query: types.CallbackQuery):
-    # Обробка натискання кнопки "Повернутися до меню"
-    await bot.send_message(callback_query.from_user.id, "Ви повернулися до головного меню.",
-                           reply_markup=markups.GenMenu)  # Заміни на свою функцію для головного меню
-    await callback_query.answer()  # Відповідаємо на callback
-
-# Отримання назви сигналу
-@dp.message_handler(state=CreateSignal.WaitingForSignalName, content_types=types.ContentTypes.TEXT)
-async def get_signal_name(message: types.Message, state: FSMContext):
-    signal_name = message.text
-    await state.update_data(signal_name=signal_name)  # Зберігаємо назву сигналу у FSM
-    # Додаємо запис у базу (зробіть інтеграцію тут)
-    signals = db.select_signals(message.from_user.id)
-    if signal_name not in signals:
-        db.add_signal(user_id=message.from_user.id, signal_name=signal_name)
-        signal_menu = markups.Signal_menu  # Меню для налаштування сигналу
-        await message.answer(f"Сигнал '{signal_name}' створено! Тепер оберіть параметри:", reply_markup=signal_menu)
-        await state.finish()  # Виходимо зі стану
-    else:
-        await message.answer(f"Сигнал '{signal_name}' вже існує. Спробуйте іншу назву:")
-
-   
-
-# Обробка кнопок створення сигналу
-@dp.message_handler(lambda message: message.text in ["Time", "Market Cap", "Liquidity", "Price Growth", "Volume", "Boosts", "Volume Growth", "Markers Growth", "Txn Growth", "⬅️ Назад"])
-async def handle_create_signal(message: types.Message):
-    if message.text == "⬅️ Назад":
-        main_menu = markups.GenMenu  # Якщо назад, повертаємось до головного меню
-        await message.answer("Вітаю! Ось головне меню:", reply_markup=main_menu)
-    elif message.text == "Price Growth":
-        await CreateSignal.WaitingForPriceGrowth.set()  # Переходимо в стан введення відсотка зростання
-        await message.answer("Введіть бажаний відсоток зростання ціни за 5 останніх хвилин (лише число):")
-        
-    elif message.text == "Time":
-        await CreateSignal.WaitingForAge.set()  # Переходимо в стан введення часу спостереження
-        await message.answer("Введіть час для спостереження (в годинах):")
-        
-    elif message.text == "Liquidity":
-        await CreateSignal.WaitingForLiquidity.set()  
-        await message.answer("Введіть ліквідність яка цікавить (в доларах):")
-    elif message.text == "Volume":
-        await CreateSignal.WaitingForVolume.set()  
-        await message.answer("Введіть мінімальний об'єм за 24 години (в доларах):")
-    elif message.text == "Market Cap":
-        await CreateSignal.WaitingForMarketCap.set()  
-        await message.answer("Введіть мінімальну капіталізацію (в доларах):")
-    elif message.text == "Boosts":
-        await CreateSignal.WaitingForBoosts.set()  
-        await message.answer("Введіть бажану мінімальну кількість бустів:")
-    elif message.text == "Volume Growth":
-        await CreateSignal.WaitingForVolumeGrowth.set()  
-        await message.answer("Введіть бажаний відсоток зростання об'єму з час у форматі xx(відсотків)/yy(хвилин):")
-    else:
-        signal_menu = markups.Signal_menu  # Показуємо меню створення сигналу
-        await message.answer(f"Ви вибрали: {message.text}", reply_markup=signal_menu)
+async def on_startup(_):
+    asyncio.create_task(check_tokens_loop()) 
+# --- FSM ---
+class WaitToken(StatesGroup):
+    waiting_identifier = State()
+    waiting_message = State()
 
 
-@dp.message_handler(state=CreateSignal.WaitingForVolumeGrowth, content_types=types.ContentTypes.TEXT)
-async def get_volume_growth(message: types.Message, state: FSMContext):
-    try:
-        volume_growth = float(message.text.split("/")[0])
-        time = message.text.split("/")[1]
-        if volume_growth <= 0 and time <=0:
-            await message.answer("Будь ласка, введіть числа більше 0.")
-            return
-        # Зберігаємо параметр у базу (зробіть інтеграцію тут)
-        db.update_signal_volume_growth(user_id=message.from_user.id, volume =volume_growth, time = time)
-
-        signal_menu = markups.Signal_menu  # Повертаємося до меню сигналів
-        await message.answer(f"Бажаний  volume_growth: {volume_growth} за час {time} хвилин збережено!", reply_markup=signal_menu)
-        await state.finish()  # Завершуємо стан
-
-    except:
-        await message.answer("Будь ласка, введіть коректне число у форматі xx/yy.")
-@dp.message_handler(state=CreateSignal.WaitingForBoosts, content_types=types.ContentTypes.TEXT)
-async def get_boosts(message: types.Message, state: FSMContext):
-    try:
-        
-        boosts = float(message.text)  # Перетворюємо введений текст на число
-        if boosts <= 0:
-            await message.answer("Будь ласка, введіть число більше 0.")
-            return
-
-        # Зберігаємо параметр у базу (зробіть інтеграцію тут)
-        db.update_signal_boosts(user_id=message.from_user.id, boosts =boosts)
-
-        signal_menu = markups.Signal_menu  # Повертаємося до меню сигналів
-        await message.answer(f"Бажану кількість: {boosts} збережено!", reply_markup=signal_menu)
-        await state.finish()  # Завершуємо стан
-
-    except ValueError:
-        await message.answer("Будь ласка, введіть коректне число.")
-@dp.message_handler(state=CreateSignal.WaitingForLiquidity, content_types=types.ContentTypes.TEXT)
-async def get_liquidity(message: types.Message, state: FSMContext):
-    try:
-        
-        liq = float(message.text)  # Перетворюємо введений текст на число
-        if liq <= 0:
-            await message.answer("Будь ласка, введіть число більше 0.")
-            return
-
-        # Зберігаємо параметр у базу (зробіть інтеграцію тут)
-        db.update_signal_liquidity(user_id=message.from_user.id, liquidity =liq)
-
-        signal_menu = markups.Signal_menu  # Повертаємося до меню сигналів
-        await message.answer(f"Бажану ліквідність: {liq} доларів збережено!", reply_markup=signal_menu)
-        await state.finish()  # Завершуємо стан
-
-    except ValueError:
-        await message.answer("Будь ласка, введіть коректне число.")
-
-@dp.message_handler(state=CreateSignal.WaitingForVolume, content_types=types.ContentTypes.TEXT)
-async def get_volume(message: types.Message, state: FSMContext):
-    try:
-        
-        volume = float(message.text)  # Перетворюємо введений текст на число
-        if volume <= 0:
-            await message.answer("Будь ласка, введіть число більше 0.")
-            return
-
-        # Зберігаємо параметр у базу (зробіть інтеграцію тут)
-        db.update_signal_volume(user_id=message.from_user.id, volume =volume)
-
-        signal_menu = markups.Signal_menu  # Повертаємося до меню сигналів
-        await message.answer(f"Бажаний об'єм: {volume} доларів збережено!", reply_markup=signal_menu)
-        await state.finish()  # Завершуємо стан
-
-    except ValueError:
-        await message.answer("Будь ласка, введіть коректне число.")
-@dp.message_handler(state=CreateSignal.WaitingForMarketCap, content_types=types.ContentTypes.TEXT)
-async def get_cap(message: types.Message, state: FSMContext):
-    try:
-        
-        cap = float(message.text)  # Перетворюємо введений текст на число
-        if cap <= 0:
-            await message.answer("Будь ласка, введіть число більше 0.")
-            return
-
-        # Зберігаємо параметр у базу (зробіть інтеграцію тут)
-        db.update_signal_cap(user_id=message.from_user.id, cap =cap)
-
-        signal_menu = markups.Signal_menu  # Повертаємося до меню сигналів
-        await message.answer(f"Бажану капіталізацію: {cap} доларів збережено!", reply_markup=signal_menu)
-        await state.finish()  # Завершуємо стан
-
-    except ValueError:
-        await message.answer("Будь ласка, введіть коректне число.")
-@dp.message_handler(state=CreateSignal.WaitingForAge, content_types=types.ContentTypes.TEXT)
-async def get_age(message: types.Message, state: FSMContext):
-    try:
-        
-        age = float(message.text)  # Перетворюємо введений текст на число
-        if age <= 0:
-            await message.answer("Будь ласка, введіть число більше 0.")
-            return
-
-        # Зберігаємо параметр у базу (зробіть інтеграцію тут)
-        db.update_signal_age(user_id=message.from_user.id, age =age)
-
-        signal_menu = markups.Signal_menu  # Повертаємося до меню сигналів
-        await message.answer(f"Бажаний час моніторингу: {age} хвилин збережено!", reply_markup=signal_menu)
-        await state.finish()  # Завершуємо стан
-
-    except ValueError:
-        await message.answer("Будь ласка, введіть коректне число.")
-# Отримання бажаного відсотка зростання ціни
-@dp.message_handler(state=CreateSignal.WaitingForPriceGrowth, content_types=types.ContentTypes.TEXT)
-async def get_price_growth(message: types.Message, state: FSMContext):
-    try:
-        
-        price_growth = float(message.text)  # Перетворюємо введений текст на число
-        if price_growth <= 0:
-            await message.answer("Будь ласка, введіть число більше 0.")
-            return
-
-        # Зберігаємо параметр у базу (зробіть інтеграцію тут)
-        db.update_signal_price_growth(user_id=message.from_user.id, price_growth =price_growth)
-
-        signal_menu = markups.Signal_menu  # Повертаємося до меню сигналів
-        await message.answer(f"Бажаний відсоток зростання ціни: {price_growth}% збережено!", reply_markup=signal_menu)
-        await state.finish()  # Завершуємо стан
-
-    except ValueError:
-        await message.answer("Будь ласка, введіть коректне число.")
-# Обробка кнопок створення сигналу
-@dp.message_handler(lambda message: message.text in ["Time", "Market Cap", "Liquidity", "Price Growth", "Volume", "Volume Growth", "Markers", "Markers Growth", "Txn Growth", "Back"])
-async def handle_create_signal(message: types.Message):
-    if message.text == "Back":
-        main_menu = markups.GenMenu   # Якщо назад, повертаємось до головного меню
-        await message.answer("Вітаю! Ось головне меню:", reply_markup=main_menu)
-    else:
-        signal_menu = markups.Signal_menu  # Показуємо меню створення сигналу
-        await message.answer(f"Ви вибрали: {message.text}", reply_markup=signal_menu)
 
 async def read_file(filepath, max_retries=5, delay=0.5):
     retries = 0
@@ -316,304 +41,554 @@ async def read_file(filepath, max_retries=5, delay=0.5):
             print(f"Файл зайнятий, спроба {retries + 1}/{max_retries}...")
             retries += 1
             await asyncio.sleep(delay)
+        except FileNotFoundError:
+            return {}
+# process_token: додає токен одразу (added_at + total_added лише якщо токен новий)
+def process_token(identifier: str, token: str, params=None):
+    if params is None:
+        params = {}
 
-async def update_mints():
-    """Оновлює список токенів у файлі."""
-    while True:
-        if os.path.exists(MINTS_FILE):
-            mints_data = await read_file(MINTS_FILE)
+    # нормалізуємо ключ токена як передано (не міняємо регістр) — але будемо порівнювати case-insensitive
+    token_key = token.strip()
+
+    # читаємо файл синхронно тут (це коротка операція)
+    if os.path.exists(DATA_FILE):
+        try:
+            with open(DATA_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, IOError):
+            data = {}
+    else:
+        data = {}
+
+    # створюємо структуру для користувача, якщо потрібно
+    if identifier not in data or not isinstance(data[identifier], dict):
+        data[identifier] = {"name": identifier, "stats": {"total_added": 0, "total_success_30": 0, "total_success_50": 0, "total_success_100": 0}}
+
+    user_entry = data[identifier]
+    stats = user_entry.setdefault("stats", {"total_added": 0, "total_success_30": 0, "total_success_50": 0, "total_success_100": 0})
+    # перевіряємо чи є вже еквівалентний токен (case-insensitive)
+    existing_key = None
+    for k in list(user_entry.keys()):
+        if k in ("name", "stats"):
+            continue
+        if k.lower() == token_key.lower():
+            existing_key = k
+            break
+
+    if existing_key is None:
+        # новий токен — додаємо і інкрементуємо total_added
+        user_entry[token_key] = params.copy()
+        user_entry[token_key]["added_at"] = datetime.utcnow().isoformat()
+        stats["total_added"] = stats.get("total_added", 0) + 1
+    else:
+        # токен вже існує — оновлюємо його params (але не інкрементуємо total_added)
+        user_entry[existing_key].update(params)
+        # за бажанням: оновлюємо added_at (чи ні) — тут не змінюємо added_at, щоб зберегти початкову дату
+
+    # запис назад
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+
+# --- хендлери ---
+@dp.message_handler(commands=["start"], state="*")
+async def start(message: types.Message, state: FSMContext):
+    
+    await message.answer("Перешлите сообщение (пользователь/канал).\n")
+    await WaitToken.waiting_identifier.set()
+    
+
+@dp.message_handler(lambda message: not message.text.startswith("/"), state=WaitToken.waiting_identifier, )
+async def get_identifier(message: types.Message, state: FSMContext):
+    identifier = None
+    token_found = None
+
+    # якщо переслане повідомлення
+    if message.forward_from:
+        identifier = f"{message.forward_from.id}"
+        display_name = message.forward_from.full_name or message.forward_from.username or str(message.forward_from.id)
+    elif message.forward_from_chat:
+        identifier = f"{message.forward_from_chat.id}"
+        display_name = message.forward_from_chat.title
+    elif message.forward_sender_name:
+        identifier = f"{message.forward_sender_name}"
+        display_name = message.forward_sender_name
+    else:
+        pattern = r"\b[A-Za-z0-9]{43,45}\b"
+        match = re.search(pattern, message.text)
+        if match:
+            token_found = match.group(0)
+            identifier = "ungrouped"
+            display_name = "ungrouped"
         else:
-            print("fuck")
-            mints_data = {}
-        if len(mints_data) < 150:
+            identifier = message.text.strip()
+            display_name = identifier
 
+# одразу зберегти name у дані
+    if not os.path.exists(DATA_FILE):
+        data = {}
+    else:
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
+            try:
+                data = json.load(f)
+            except json.JSONDecodeError:
+                data = {}
 
-            url = "https://api.dexscreener.com/token-profiles/latest/v1"
-            response = requests.get(url)
-            data = response.json()
-    
-            new_mints =[]
-            for token in data:
-                if token["chainId"] == "solana":
-                    if "links" in token:
-                        links = token["links"]
-                    else:
-                        links = None
-                    mint = token["tokenAddress"]
-                    url = token["url"]
-                    if mint not in mints_data:
-                        mints_data[mint] = {"added": datetime.utcnow().isoformat(), "prices":[], "volume": 0, "liquidity":0, "marketCap": 0,"boosts":0, "links": links, "url": url, "priceChange": 0, "price": 0}
+    if identifier not in data:
+        data[identifier] = {"name": display_name, "stats": {"total_added": 0, "total_success_30": 0, "total_success_50": 0, "total_success_100": 0}}
+
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+        # якщо є пересланий ідентифікатор → одразу пробуємо знайти токен у цьому ж тексті
+    if identifier:
+        pattern = r"\b[A-Za-z0-9]{43,45}\b"
+        match = re.search(pattern, message.text)
+        if match:
+            token_found = match.group(0)
+            process_token(identifier, token_found)
+            await message.answer(f"Найден токен: {token_found}\nИдентификатор: {identifier}")
+            global running_tasks
+            if "get_token_info" not in running_tasks or running_tasks["get_token_info"].done():
+                running_tasks["get_token_info"] = asyncio.create_task(get_token_info())
  
-
-    
             
- 
+            # цикл знову з початку
+            await WaitToken.waiting_identifier.set()
+            await message.answer("Перешлите новое сообщение")
+            return
+        else:
+            await state.update_data(identifier=identifier)
+            await message.answer(f"Идентификатор: {identifier}\n"
+                                 "В этом сообщении токен не найден.")
+            await WaitToken.waiting_message.set()
+            return
 
-            retries = 0
-            while retries < 5:
-                try:                    
-                    with open(MINTS_FILE, "w") as f:
-                        json.dump(mints_data, f, indent=2) 
-                    break
-                except IOError as e:
+    # якщо не переслане повідомлення → користувач вводить сам ідентифікатор
+    identifier = message.text.strip()
+    await state.update_data(identifier=identifier)
+    await message.answer(f"Идентификатор сохранен: {identifier}")
+    await WaitToken.waiting_message.set()
 
-                    print(f"Файл зайнятий, спроба {retries + 1}/5...")
-                    retries += 1
-                    asyncio.sleep(0.5)
-        await asyncio.sleep(60)
-    
+@dp.message_handler(lambda message: not message.text.startswith("/"), state=WaitToken.waiting_message)
+async def get_message(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    identifier = data.get("identifier")
+
+    pattern = r"\b[A-Za-z0-9]{43,45}\b"
+    match = re.search(pattern, message.text)
+    if match:
+        token = match.group(0)
+        process_token(identifier, token)
+        await message.answer(f"Найден токен: {token}\nИдентификатор: {identifier}")
+        global running_tasks
+        if "get_token_info" not in running_tasks or running_tasks["get_token_info"].done():
+            running_tasks["get_token_info"] = asyncio.create_task(get_token_info())
+    else:
+        await message.answer("В этом сообщении токен не найден.")
+
+    # цикл знову з початку
+    await WaitToken.waiting_identifier.set()
+    await message.answer("Перешлите новое сообщение")
+
 async def get_mint_list():
-    """Завантажує список токенів з файлу."""
-    if os.path.exists(MINTS_FILE):
-        data = await read_file(MINTS_FILE)
-        mints_data = list(data.keys())
+    if os.path.exists(DATA_FILE):
+        data = await read_file(DATA_FILE)
+        mints_data = []
+        for identifier, tokens in data.items():
+            for k in tokens.keys():
+                if k not in ("stats", "name"):  # пропускаємо службові ключі
+                    mints_data.append(k)
         return mints_data
     return []
 
-async def get_token_prices():
-    """Отримує ціни всіх моніторених токенів."""
+# get_token_info: асинхронний, коректно співставляє токени, встановлює initial_price/price тощо
+async def get_token_info():
+    """Отримує ціни і оновлює записи. added_at і total_added вже ставляться в process_token"""
     while True:
-        data = []
-        if os.path.exists(MINTS_FILE):
-            mints_data = await read_file(MINTS_FILE)
-            mints = await get_mint_list()
-                
-        else:
-            mints_data = {}
- 
-        if not mints:
+        mints_data = await read_file(DATA_FILE)
+        # збираємо список унікальних токенів (ігноруємо 'name' і 'stats')
+        all_tokens = []
+        for identifier, user_tokens in mints_data.items():
+            if not isinstance(user_tokens, dict):
+                continue
+            for k in user_tokens.keys():
+                if k in ("name", "stats"):
+                    continue
+                all_tokens.append(k)
 
-            return []
-        if i % 30 == 0:
-            for i in range(int(len(mints)//30)):
+        if not all_tokens:
+            # нічого немає — трохи почекати
+            await asyncio.sleep(10)
+            continue
 
+        # робимо запити по пачках
+        collected = []
+        for i in range(0, len(all_tokens), 29):
+            scan_mints = all_tokens[i:i+29]
+            url = f"https://api.dexscreener.com/tokens/v1/solana/{','.join(scan_mints)}"
+            try:
+                resp = requests.get(url, timeout=10)
+            except Exception as e:
+                print("Запрос к dexscreener не удался:", e)
+                await asyncio.sleep(1)
+                continue
 
-                scan_mints = mints[(i)*30:(i+1)*30]
+            if resp and resp.status_code == 200:
+                try:
+                    j = resp.json()
+                except Exception:
+                    continue
+                if isinstance(j, list):
+                    collected.extend(j)
 
-                url = f"https://api.dexscreener.com/tokens/v1/solana/{','.join(scan_mints)}"
-                response = requests.get(url)
+        if not collected:
+            # якщо API повернув пусто — зачекати і повторити
+            await asyncio.sleep(10)
+            continue
 
-                data = data + response.json()
-        else:
-            for i in range(int(len(mints)//30)+1):
+        # Для швидкого доступу зробимо словник за адресою (lowercase) -> mint_data
+        api_by_address = {}
+        for mint in collected:
+            addr = mint.get("baseToken", {}).get("address")
+            if not addr:
+                continue
+            api_by_address[addr.lower()] = mint
 
+        # Оновлюємо mints_data
+        modified = False
+        for identifier, user_tokens in mints_data.items():
+            if not isinstance(user_tokens, dict):
+                continue
+            stats = user_tokens.setdefault("stats", {})
+            # створимо список ключів токенів, щоб не гуляти по службових полях
+            token_keys = [k for k in user_tokens.keys() if k not in ("name", "stats")]
 
-                scan_mints = mints[(i)*30:(i+1)*30]
+            for key in token_keys:
+                # знайдемо відповідь API: порівнюємо ключ (user key) з lower адресами
+                match_addr = None
+                # переважно ключ вже є у api_by_address (якщо користувач додав саме ту адресу)
+                if key.lower() in api_by_address:
+                    match_addr = key.lower()
+                else:
+                    # іноді ключ може бути в іншому форматі — але ми вже зібрали всі адреси, тому нічого робити
+                    # просто пропускаємо, якщо не знайдено
+                    match_addr = None
 
-                url = f"https://api.dexscreener.com/tokens/v1/solana/{','.join(scan_mints)}"
-                response = requests.get(url)
+                if match_addr is None:
+                    # API не знайшов цього токена в останньому зборі — нічого оновлювати
+                    continue
 
-                data = data + response.json()
+                mint = api_by_address[match_addr]
+                token_info = user_tokens.setdefault(key, {})
 
+                # initial_price ставимо тільки якщо немає
+                price_native = mint.get("priceNative")
+                if "initial_price" not in token_info and price_native is not None:
+                    token_info["initial_price"] = price_native
 
-            
-
-    
-        for mint in data:
-            address = mint["baseToken"]["address"]
-            
- 
-            if address in mints_data:
-
-                mints_data[address]["volume"] = mint["volume"]["h24"]
-                if "liquidity" in mint:
-                    mints_data[address]["liquidity"] = mint["liquidity"]["usd"]
-                if "boosts" in mint:
-                    mints_data[address]["boosts"] = mint["boosts"]["active"]
+                # завжди оновлюємо поточну ціну та інші поля
+                if price_native is not None:
+                    token_info["price"] = price_native
+                    if "max_price" not in token_info:
+                        token_info["max_price"] = price_native
+                    else:
+                        # якщо нова ціна більше збереженої максимальної → оновлюємо
+                        if price_native > token_info["max_price"]:
+                            token_info["max_price"] = price_native
+                if "volume" in mint:
+                    token_info["volume"] = mint["volume"].get("h24")
+                if "liquidity" in mint and isinstance(mint["liquidity"], dict):
+                    token_info["liquidity"] = mint["liquidity"].get("usd")
+                if "boosts" in mint and isinstance(mint["boosts"], dict):
+                    token_info["boosts"] = mint["boosts"].get("active")
                 if "marketCap" in mint:
-                    mints_data[address]["marketCap"] = mint["marketCap"]
-                if "priceNative" in mint:
-                    mints_data[address]["price"] = mint["priceNative"]
-                if "priceChange" in mint and "m5" in mint["priceChange"]:
-                    mints_data[address]["priceChange"] = mint["priceChange"]["m5"]
-                elif "priceChange" in mint and "h1" in mint["priceChange"]:
-                    mints_data[address]["priceChange"] = mint["priceChange"]["h1"]
-                
-                elif "priceChange" in mint and "h24" in mint["priceChange"]:
-                    mints_data[address]["priceChange"] = mint["priceChange"]["h24"]
-                info = {"time": datetime.utcnow().isoformat(), "volume": mint["volume"]["m5"]}
-                mints_data[address]["prices"].append(info)    
-                
-                        
-        retries = 0
-        while retries < 5:
-            try:                    
-                with open(MINTS_FILE, "w") as f:
-                    json.dump(mints_data, f, indent=2) 
-                break
-            except IOError as e:
+                    token_info["marketCap"] = mint.get("marketCap")
+                priceChange = mint.get("priceChange", {})
+                token_info["priceChange"] = priceChange.get("h24") or priceChange.get("h1") or priceChange.get("m5")
 
-                print(f"Файл зайнятий, спроба {retries + 1}/5...")
-                retries += 1
-                await asyncio.sleep(0.5)
+                # не змінюємо added_at тут (бо його має ставити process_token при додаванні)
+                modified = True
+
+        if modified:
+            retries = 0
+            while retries < 5: 
+                try: 
+                    with open(DATA_FILE, "w", encoding="utf-8") as f: 
+                        json.dump(mints_data, f, indent=2, ensure_ascii=False) 
+                    break 
+                except IOError: 
+                    retries += 1 
+                    print(f"Файл зайнятий, спроба {retries}/5...") 
+                    await asyncio.sleep(0.5)
+
+        # чекати перед наступним циклом (поставив 10 секунд, можна змінити)
         await asyncio.sleep(10)
 
-async def update_prices(growth, age, user_id, name, market_cap, volume, liquidity, boosts,volume_growth, time_growth):
-    """Моніторить ціни й аналізує зміни для всіх користувачів."""
-    used_mints = []
 
+        
+
+async def check_tokens_loop():
+    """Перевіряє токени щогодини, оновлює статистику"""
     while True:
+        try:
+            data = await read_file(DATA_FILE)
+        except FileNotFoundError:
+            data = {}
 
-        if not db.check_signal_status(user_id, name):
+        now = datetime.utcnow()
+        modified = False
+        for user_id, user_data in list(data.items()):
+            for mint in list(user_data.keys()):   # ← робимо список ключів
+                info = user_data[mint]
+                if not isinstance(info, dict) or "added_at" not in info:
+                    continue
+                if isinstance(info, dict) and "added_at" in info:
+                    added_at_str = info["added_at"]
+                    stats = user_data.get(
+                        "stats",
+                        {"total_added": 0, "total_success_30": 0, "total_success_50": 0, "total_success_100": 0}
+                    )
             
-            return
-        if os.path.exists(MINTS_FILE):
-            mints_data = await read_file(MINTS_FILE)
+                    token_items = {k: v for k, v in user_data.items() if k != "stats"}
 
+
+                    initial_price = float(info.get("initial_price", 0))
+                    current_price = float(info.get("price", 0))
+                    max_p = float(info.get("max_price"))
+                    # Ініціалізуємо прапорці, якщо їх немає
+                    if "success_30" not in info:
+                        info["success_30"] = False
+                        modified = True
+                    if "success_50" not in info:
+                        info["success_50"] = False
+                        modified = True
+                    if "success_100" not in info:
+                        info["success_100"] = False
+                        modified = True
+
+                    added_at = datetime.fromisoformat(added_at_str) if added_at_str else now
+                    remove = False
+                    
+                    # Перевірка на зростання ≥30%
+                    if max_p >= 1.3 * initial_price and not info["success_30"]:
+                        stats["total_success_30"] = stats.get("total_success_30", 0) + 1
+                        info["success_30"] = True
+                        modified = True
+    
+                    # Перевірка на зростання ≥50%
+                    if max_p >= 1.5 * initial_price and not info["success_50"]:
+                        stats["total_success_50"] = stats.get("total_success_50", 0) + 1
+                        info["success_50"] = True
+                        modified = True
+
+                # Перевірка на зростання ≥100%
+                    if max_p >= 2 * initial_price and not info["success_100"]:    
+                        stats["total_success_100"] = stats.get("total_success_100", 0) + 1
+                        info["success_100"] = True
+                        modified = True
+
+                    # Видалення старих (>1 день)
+                    if now - added_at > timedelta(days=1):
+                        remove = True
+
+                    if remove:
+                        if "deleted_growths" not in stats:
+                            stats["deleted_growths"] = []
+                        init_p = float(info.get("initial_price", 0))
+                        max_p = float(info.get("max_price", 0))
+                        if init_p > 0 and max_p > 0:
+                            growth = (max_p - init_p) / init_p * 100
+                            stats["avg_growth_deleted_count"] = stats.get("avg_growth_deleted_count", 0) + 1                      
+                            stats["deleted_growths"].append(growth)
+
+                        del user_data[mint]
+                        modified = True
+
+                    user_data["stats"] = stats
+                    data[user_id] = user_data
+
+        if modified:
+            retries = 0 
+            while retries < 5: 
+                try: 
+                    with open(DATA_FILE, "w", encoding="utf-8") as f: 
+                        json.dump(data, f, indent=2, ensure_ascii=False) 
+                    break 
+                except IOError: 
+                    retries += 1 
+                    print(f"Файл зайнятий, спроба {retries}/5...") 
+                    await asyncio.sleep(0.5)
+
+        # Чекати 1 годину до наступної перевірки
+        await asyncio.sleep(100)
+from aiogram import types
+from collections import Counter
+
+# --- /info: вивід статистики по всім ---
+@dp.message_handler(commands=["info"], state="*")
+async def cmd_info(message: types.Message):
+    """Виводить статистику по всім користувачам"""
+    try:
+        data = await read_file(DATA_FILE)
+    except FileNotFoundError:
+        await message.answer("Файл з даними отсутствует.")
+        return
+
+    if not data:
+        await message.answer("Статистика пустая.")
+        return
+
+    lines = []
+    for user_id, user_data in data.items():
+        name = user_data.get("name", user_id)
+        stats = user_data.get("stats", {"total_added": 0})
+        token_keys = [k for k in user_data.keys() if k not in ("stats", "name")]
+
+        # підрахунок середнього максимального росту
+        growths = []
+        for tk in token_keys:
+            info = user_data[tk]
+            init_p = float(info.get("initial_price", 0))
+            max_p = float(info.get("max_price", 0))
+            if init_p and max_p and init_p > 0:
+                growths.append((max_p - init_p) / init_p * 100)
+        deleted_growths = stats.get("deleted_growths", [])
+        growths.extend(deleted_growths)
+
+        active_sum = sum(growths)
+        active_count = len(growths)
+        avg_growth_total = active_sum / active_count if active_count > 0 else 0
+
+        bins = Counter()
+        for g in growths:
+            bin_start = int(g // 5) * 5
+            bin_end = bin_start + 5
+            bins[(bin_start, bin_end)] += 1
+        mode_interval = max(bins, key=bins.get) if bins else None
+
+        # робимо клікабельну команду
+
+
+        if mode_interval:
+            lines.append(
+                f"@{name} (/{user_id}):\n"
+                f"  Токенов сейчас: {len(token_keys)}\n"
+                f"  Добавлено всего: {stats.get('total_added',0)}\n"
+                f"  Успешных (≥1.3×): {stats.get('total_success_30',0)} "
+                f"({(stats.get('total_success_30',0)/stats.get('total_added',0)*100 if stats.get('total_added',0)>0 else 0):.2f}%)\n"
+                f"  Успешных (≥1.5×): {stats.get('total_success_50',0)} "
+                f"({(stats.get('total_success_50',0)/stats.get('total_added',0)*100 if stats.get('total_added',0)>0 else 0):.2f}%)\n"
+                f"  Успешных (≥2×): {stats.get('total_success_100',0)} "
+                f"({(stats.get('total_success_100',0)/stats.get('total_added',0)*100 if stats.get('total_added',0)>0 else 0):.2f}%)\n"
+                f"  Средний макс. рост: {avg_growth_total:.2f}%\n"
+                f"  Мода роста: {mode_interval[0]}–{mode_interval[1]}% (чаще всего)"
+            )
         else:
-            mints_data = {}
-        mints = list(mints_data.keys())
-        for mint in mints:
-            if os.path.exists(MINTS_FILE):
-                mints_data = await read_file(MINTS_FILE)
-            else:
-                mints_data = {}
+            lines.append(
+                f"@{name} (/{user_id}):\n"
+                f"  Токенов сейчас: {len(token_keys)}\n"
+                f"  Добавлено всего: {stats.get('total_added',0)}\n"
+                f"  Успешных (≥1.3×): {stats.get('total_success_30',0)} "
+                f"({(stats.get('total_success_30',0)/stats.get('total_added',0)*100 if stats.get('total_added',0)>0 else 0):.2f}%)\n"
+                f"  Успешных (≥1.5×): {stats.get('total_success_50',0)} "
+                f"({(stats.get('total_success_50',0)/stats.get('total_added',0)*100 if stats.get('total_added',0)>0 else 0):.2f}%)\n"
+                f"  Успешных (≥2×): {stats.get('total_success_100',0)} "
+                f"({(stats.get('total_success_100',0)/stats.get('total_added',0)*100 if stats.get('total_added',0)>0 else 0):.2f}%)\n"
+                f"  Средний макс. рост: {avg_growth_total:.2f}%\n"
+                f"  Мода роста: данных нету"
+            )
 
-            time_to_growth = int(time_growth*2)
-            price_growth = float(mints_data[mint]["priceChange"])
-            volumes = [float(op["volume"]) for op in mints_data[mint]["prices"][-time_to_growth:-1]]
-            token_boosts = 0
-            if mints_data[mint]["boosts"]:
-                token_boosts  = float(mints_data[mint]["boosts"])
-                if token_boosts > 400:
-                    url = mints_data[mint]["url"]
-                    await bot.send_message(user_id, url)
-            if len(volumes) > 2:
+    response = "\n\n".join(lines)
+    await message.answer(response)
 
 
-                max_volume = max(volumes)         
-                min_volume = min(volumes)
-            else:
-                max_volume = 0
-                min_volume = 0
+EXCLUDED_COMMANDS = {"/start", "/info"}
 
-            token_market_cap = float(mints_data[mint]["marketCap"])
-            token_volume = float(mints_data[mint]["volume"])
+
+@dp.message_handler(commands=None, state="*")
+async def catch_user_commands(message: types.Message):
+    text = message.text.strip()
+    if not text.startswith("/"):
+        return
     
-            token_liquidity = float(mints_data[mint]["liquidity"])
-                
+    cmd = text.split()[0]
+    if cmd in EXCLUDED_COMMANDS:
+        return
 
-            if mint not in used_mints and price_growth/100 >  float(growth) / 100 and max_volume >= min_volume * (volume_growth + 100) / 100 and token_market_cap >= market_cap and token_volume >= volume and token_liquidity >= liquidity and token_boosts >= boosts:
-                url = mints_data[mint]["url"]
+    try:
+        data = await read_file(DATA_FILE)
+    except FileNotFoundError:
+        await message.answer("Файл з даними відсутній.")
+        return
 
-                message = f"🚀 Сигнал {name}\nЦіна {url} зросла мінімум на {growth}%!\n"
-                links = mints_data[mint]["links"]
-                if links:
-                    for link in links:
-                        if "label" in link:
-                            label = link["label"]
-                        elif "type" in link:
-                            label = link["type"]
-                        else:
-                            label = ""
-                        link_url = link["url"]
-                        message += f"Назва ресурсу: {label}\nПосилання: {link_url}\n"
-                await bot.send_message(user_id, message)
+    if not data:
+        await message.answer("Статистика порожня.")
+        return
 
-                used_mints.append(mint)
+    user_key = cmd.lstrip("/")
+    user_data = data.get(user_key)
+    if not user_data:
+        await message.answer(f"Немає даних для {cmd}")
+        return
 
+    stats = user_data.get("stats", {"total_added": 0})
+    token_keys = [k for k in user_data.keys() if k not in ("stats", "name")]
+    growths = []
+    for tk in token_keys:
+        info = user_data[tk]
+        init_p = float(info.get("initial_price", 0))
+        max_p = float(info.get("max_price", 0))
+        if init_p and max_p and init_p > 0:
+            growths.append((max_p - init_p) / init_p * 100)
+    deleted_growths = stats.get("deleted_growths", [])
+    growths.extend(deleted_growths)
 
-                '''
-                    del mints_data[mint]
-                    retries = 0
-                    while retries < 5:
-                        try:                    
-                            with open(MINTS_FILE, "w") as f:
-                                json.dump(mints_data, f, indent=2) 
-                                break
-                        except IOError as e:
+    avg_growth_total = sum(growths) / len(growths) if growths else 0
 
-                            print(f"Файл зайнятий, спроба {retries + 1}/5...")
-                            retries += 1
-                            await asyncio.sleep(0.5)
-                        '''
+    bins = Counter()
+    for g in growths:
+        bin_start = int(g // 5) * 5
+        bin_end = bin_start + 5
+        bins[(bin_start, bin_end)] += 1
+    mode_interval = max(bins, key=bins.get) if bins else None
 
-        await asyncio.sleep(10)  # Перевірка кожні 30 секунд
+    response = (
+        f"@{user_data.get('name', user_key)} ({user_key}):\n"
+                f"  Токенов сейчас: {len(token_keys)}\n"
+                f"  Добавлено всего: {stats.get('total_added',0)}\n"
+                f"  Успешных (≥1.3×): {stats.get('total_success_30',0)} "
+                f"({(stats.get('total_success_30',0)/stats.get('total_added',0)*100 if stats.get('total_added',0)>0 else 0):.2f}%)\n"
+                f"  Успешных (≥1.5×): {stats.get('total_success_50',0)} "
+                f"({(stats.get('total_success_50',0)/stats.get('total_added',0)*100 if stats.get('total_added',0)>0 else 0):.2f}%)\n"
+                f"  Успешных (≥2×): {stats.get('total_success_100',0)} "
+                f"({(stats.get('total_success_100',0)/stats.get('total_added',0)*100 if stats.get('total_added',0)>0 else 0):.2f}%)\n"
+                f"  Средний макс. рост: {avg_growth_total:.2f}%\n"
+                f"  Мода роста: {f'{mode_interval[0]}–{mode_interval[1]}%' if mode_interval else 'даних нету'}"
+    )
 
-    
+    await message.answer(response)
 
-    
+    # --- малюємо графік ---
+    if growths:
+        fig, ax = plt.subplots(figsize=(6, 4))
+        ax.hist(growths, bins=20, edgecolor="black", alpha=0.7)
+        ax.set_title("Распредиление приростов (%)")
+        ax.set_xlabel("Прирост (%)")
+        ax.set_ylabel("Количество токенов")
 
+        buf = io.BytesIO()
+        plt.tight_layout()
+        plt.savefig(buf, format="png")
+        buf.seek(0)
+        plt.close(fig)
 
-        
-async def remove_inactive():
-    while True:
-        if os.path.exists(MINTS_FILE):
-            mints_data = await read_file(MINTS_FILE)
-        else:
-            print("fuck")
-            mints_data = {}
-        to_delete = []
-
-        for mint in mints_data:
-            if len(mints_data[mint]["prices"])>2:
-                volume = mints_data[mint]["prices"][-1]["volume"]
-                price_growth = float(mints_data[mint]["priceChange"])
-                boosts = float(mints_data[mint]["boosts"])
-                if datetime.fromisoformat(mints_data[mint]["added"]) < datetime.utcnow() - timedelta(hours=24) or (volume < 70000 and mints_data[mint]["volume"] < 1000000 and boosts < 400) or (mints_data[mint]["volume"] > 1000000 and volume < 8000):
-                    to_delete.append(mint)
-
-
-        for mint in to_delete:
-            del mints_data[mint]
-        retries = 0
-        while retries < 5:
-            try:                    
-                with open(MINTS_FILE, "w") as f:
-                    json.dump(mints_data, f, indent=2) 
-                break
-            except IOError as e:
-
-                print(f"Файл зайнятий, спроба {retries + 1}/5...")
-                retries += 1
-                await asyncio.sleep(0.5)
-        await asyncio.sleep(180)
-@dp.callback_query_handler(lambda c: c.data.startswith('activate_signal_'))
-async def activate_signal(callback_query: types.CallbackQuery):
-    signal_name = callback_query.data[len('activate_signal_'):]
-    info = db.select_signal_info(user_id=callback_query.from_user.id, signal_name=signal_name)
-    
-    name, growth, age, market_cap, volume, liquidity, boosts,volume_growth, time_growth = info
-
-    await bot.send_message(callback_query.from_user.id, f"Сигнал {name} активовано.")
-    await callback_query.answer() 
-    global running_tasks
-    if "remove_inactive" not in running_tasks or running_tasks["remove_inactive"].done():
-        running_tasks["remove_inactive"] = asyncio.create_task(remove_inactive())
-    if "update_mints" not in running_tasks or running_tasks["update_mints"].done():
-        running_tasks["update_mints"] = asyncio.create_task(update_mints())
-    await asyncio.sleep(1)
-    if "get_token_prices" not in running_tasks or running_tasks["get_token_prices"].done():
-        running_tasks["get_token_prices"] = asyncio.create_task(get_token_prices())
-    await asyncio.sleep(1)
-    
-    await asyncio.sleep(1)
-    db.change_signal_status(callback_query.from_user.id, name, True)
-    await asyncio.sleep(0.5)
-    await update_prices(growth, age, callback_query.from_user.id, name, market_cap, volume, liquidity, boosts,volume_growth, time_growth)
-
-    
-        
-        
-    
-    
-@dp.callback_query_handler(lambda c: c.data.startswith('deactivate_signal_'))
-async def deactivate_signal(callback_query: types.CallbackQuery):
-    signal_name = callback_query.data[len('deactivate_signal_'):]
-    info = db.select_signal_info(user_id=callback_query.from_user.id, signal_name=signal_name)
-    
-    name, growth, age, market_cap, volume, liquidity, boosts,volume_growth, time_growth = info
-    db.change_signal_status(callback_query.from_user.id, name, False)
-    await callback_query.answer() 
-    await bot.send_message(callback_query.from_user.id, f"Сигнал {name} деактивовано.")
-    
+        await message.answer_photo(photo=buf)
 
 
-    
 
+# --- запуск ---
+if __name__ == "__main__":
+    executor.start_polling(dp, skip_updates=True, on_startup=on_startup)
 
-  
-
-if __name__ == '__main__':
-    executor.start_polling(dp, skip_updates=True)
 
