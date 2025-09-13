@@ -436,19 +436,19 @@ async def check_tokens_loop():
                     remove = False
                     
                     # Перевірка на зростання ≥30%
-                    if max_p >= 1.3 * initial_price and not info["success_30"]:
+                    if max_p >= 1.3 * initial_price and info["success_30"] == False:
                         stats["total_success_30"] = stats.get("total_success_30", 0) + 1
                         info["success_30"] = True
                         modified = True
     
                     # Перевірка на зростання ≥50%
-                    if max_p >= 1.5 * initial_price and not info["success_50"]:
+                    if max_p >= 1.5 * initial_price and info["success_50"] == False:
                         stats["total_success_50"] = stats.get("total_success_50", 0) + 1
                         info["success_50"] = True
                         modified = True
 
                 # Перевірка на зростання ≥100%
-                    if max_p >= 2 * initial_price and not info["success_100"]:    
+                    if max_p >= 2 * initial_price and info["success_100"] == False:    
                         stats["total_success_100"] = stats.get("total_success_100", 0) + 1
                         info["success_100"] = True
                         modified = True
@@ -685,8 +685,17 @@ async def cmd_info(message: types.Message):
                 f"  Мода росту: даних немає"
             )
 
-    response = "\n\n".join(lines)
-    await message.answer(response)
+    MAX_LEN = 4000
+    buffer = ""
+    for block in lines:
+        block_text = block + "\n\n"
+        if len(buffer) + len(block_text) > MAX_LEN:
+            await message.answer(buffer.strip())
+            buffer = block_text
+        else:
+            buffer += block_text
+    if buffer:
+        await message.answer(buffer.strip())
 
 
 
